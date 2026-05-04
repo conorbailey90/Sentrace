@@ -1,0 +1,23 @@
+.env
+
+# Virtual environment
+venv/
+
+# Database
+*.db
+
+# Raw list data
+list-examples/
+list-archive/
+
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
