@@ -1,5 +1,8 @@
 import threading
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -537,22 +540,32 @@ def get_snapshot(snapshot_id: int, db: Session = Depends(get_db)):
 def get_audit(
     source_list: Optional[str] = None,
     change_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     entity_id: Optional[int] = None,
     snapshot_id: Optional[int] = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
+    print(source_list, change_type, date_from, date_to, entity_id, snapshot_id, page, page_size)
     query = db.query(EntityAudit).order_by(EntityAudit.changed_at.desc())
 
     if source_list:
         if source_list not in VALID_SOURCE_LISTS:
             raise HTTPException(status_code=400, detail=f"Invalid source_list. Must be one of: {sorted(VALID_SOURCE_LISTS)}")
         query = query.filter(EntityAudit.source_list == source_list)
+
     if change_type:
         if change_type not in {"added", "updated", "removed"}:
             raise HTTPException(status_code=400, detail="change_type must be one of: added, updated, removed")
         query = query.filter(EntityAudit.change_type == change_type)
+
+    if date_from:
+        query = query.filter(EntityAudit.changed_at >= date_from)
+    if date_to:
+        query = query.filter(EntityAudit.changed_at <= date_to)
+
     if entity_id is not None:
         query = query.filter(EntityAudit.entity_id == entity_id)
     if snapshot_id is not None:
