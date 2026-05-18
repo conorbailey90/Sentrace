@@ -130,9 +130,11 @@ def _scalar_fields(source):
 # Core upsert
 # ---------------------------------------------------------------------------
 
-def upsert_entity(session, entity_data):
+def upsert_entity(entity_data, existing_map):
     """
-    Insert or update a single entity without flushing.
+    Insert or update a single entity using an in-memory lookup (no DB queries).
+
+    existing_map: dict of source_id -> Entity, preloaded for the whole source list.
 
     Returns (action, prev_data, new_data, entity) where:
       action    — "inserted" or "updated"
@@ -140,10 +142,7 @@ def upsert_entity(session, entity_data):
       new_data  — scalar-field dict of the values being written
       entity    — the Entity ORM object (id populated after the next batch flush)
     """
-    existing = session.query(Entity).filter_by(
-        source_list=entity_data["source_list"],
-        source_id=entity_data["source_id"],
-    ).first()
+    existing = existing_map.get(entity_data["source_id"])
 
     if existing:
         prev_data = _scalar_fields(existing)
@@ -157,8 +156,6 @@ def upsert_entity(session, entity_data):
         existing.last_updated = entity_data["last_updated"]
         existing.is_active = entity_data["is_active"]
         existing.remarks = entity_data.get("remarks")
-        existing.name_variants.clear()
-        existing.programs.clear()
         entity = existing
         action = "updated"
     else:
@@ -177,7 +174,6 @@ def upsert_entity(session, entity_data):
             is_active=entity_data["is_active"],
             remarks=entity_data.get("remarks"),
         )
-        session.add(entity)
         action = "inserted"
 
     for variant in entity_data["name_variants"]:
@@ -215,95 +211,133 @@ def _load_entities(session, label, source_list, entities, snapshot):
     seen_source_ids = set()
     pending_audits = []
     now = snapshot.fetched_at
-    batch_size = 500
 
-    # Buffer upsert results so we can flush once per batch instead of per entity.
-    batch_buffer = []  # list of (action, prev_data, new_data, entity, entity_data)
+    # Preload all existing entities for this source list in one query.
+    print(f"  [{label}] Loading existing entities...")
+    existing_entities = session.query(Entity).filter_by(source_list=source_list).all()
+    existing_map = {e.source_id: e for e in existing_entities}
+    print(f"  [{label}] Found {len(existing_map)} existing entities")
 
-    for i, entity_data in enumerate(entities, start=1):
+    # First pass: classify each incoming entity as insert, update, or unchanged.
+    to_insert = []   # list of entity_data dicts
+    to_update = []   # list of (entity_data, existing Entity, prev_data)
+    unchanged = []   # list of (entity_data, existing Entity)
+
+    for entity_data in entities:
         seen_source_ids.add(entity_data["source_id"])
-        action, prev_data, new_data, entity = upsert_entity(session, entity_data)
-        batch_buffer.append((action, prev_data, new_data, entity, entity_data))
+        existing = existing_map.get(entity_data["source_id"])
+        if existing is None:
+            to_insert.append(entity_data)
+        else:
+            prev_data = _scalar_fields(existing)
+            new_data = _scalar_fields(entity_data)
+            if prev_data != new_data:
+                to_update.append((entity_data, existing, prev_data))
+            else:
+                unchanged.append((entity_data, existing))
 
-        if i % batch_size == 0:
-            session.flush()  # one round trip per batch — populates entity.id for inserts
-            for action, prev_data, new_data, entity, entity_data in batch_buffer:
-                if action == "inserted":
-                    inserted += 1
-                    pending_audits.append(EntityAudit(
-                        snapshot_id=snapshot.id,
-                        entity_id=entity.id,
-                        source_list=source_list,
-                        source_id=entity_data["source_id"],
-                        change_type="added",
-                        changed_at=now,
-                        primary_name=entity_data["primary_name"],
-                        previous_data=None,
-                        new_data=json.dumps(new_data),
-                    ))
-                elif action == "updated" and prev_data != new_data:
-                    updated += 1
-                    pending_audits.append(EntityAudit(
-                        snapshot_id=snapshot.id,
-                        entity_id=entity.id,
-                        source_list=source_list,
-                        source_id=entity_data["source_id"],
-                        change_type="updated",
-                        changed_at=now,
-                        primary_name=entity_data["primary_name"],
-                        previous_data=json.dumps(prev_data),
-                        new_data=json.dumps(new_data),
-                    ))
-            session.add_all(pending_audits)
-            pending_audits.clear()
-            batch_buffer.clear()
-            session.flush()
-            print(f"  [{label}] Processed {i}...")
+    print(f"  [{label}] {len(to_insert)} inserts, {len(to_update)} updates, {len(unchanged)} unchanged")
 
-    # Flush any remaining entities in the last partial batch
-    if batch_buffer:
+    # Bulk-delete variants and programs only for entities that actually changed.
+    if to_update:
+        update_ids = [e.id for _, e, _ in to_update]
+        session.query(NameVariant).filter(NameVariant.entity_id.in_(update_ids)).delete(synchronize_session=False)
+        session.query(Program).filter(Program.entity_id.in_(update_ids)).delete(synchronize_session=False)
+
+    # Apply updates in memory and add new variants/programs.
+    for entity_data, existing, prev_data in to_update:
+        existing.entity_type = entity_data["entity_type"]
+        existing.primary_name = entity_data["primary_name"]
+        existing.country = entity_data["country"]
+        existing.date_of_birth = entity_data["date_of_birth"]
+        existing.nationality = entity_data["nationality"]
+        existing.date_listed = entity_data["date_listed"]
+        existing.date_delisted = entity_data["date_delisted"]
+        existing.last_updated = entity_data["last_updated"]
+        existing.is_active = entity_data["is_active"]
+        existing.remarks = entity_data.get("remarks")
+        for variant in entity_data["name_variants"]:
+            existing.name_variants.append(NameVariant(
+                name=variant["name"],
+                variant_type=variant["variant_type"],
+                source=variant["source"],
+            ))
+        for program_name in entity_data["programs"]:
+            existing.programs.append(Program(program_name=program_name))
+
+    # Build new Entity objects for inserts.
+    new_entities = []
+    for entity_data in to_insert:
+        entity = Entity(
+            source_list=entity_data["source_list"],
+            source_id=entity_data["source_id"],
+            entity_type=entity_data["entity_type"],
+            primary_name=entity_data["primary_name"],
+            country=entity_data["country"],
+            date_of_birth=entity_data["date_of_birth"],
+            nationality=entity_data["nationality"],
+            date_listed=entity_data["date_listed"],
+            date_delisted=entity_data["date_delisted"],
+            last_updated=entity_data["last_updated"],
+            is_active=entity_data["is_active"],
+            remarks=entity_data.get("remarks"),
+        )
+        for variant in entity_data["name_variants"]:
+            entity.name_variants.append(NameVariant(
+                name=variant["name"],
+                variant_type=variant["variant_type"],
+                source=variant["source"],
+            ))
+        for program_name in entity_data["programs"]:
+            entity.programs.append(Program(program_name=program_name))
+        new_entities.append((entity_data, entity))
+        session.add(entity)
+
+    # Flush inserts to get IDs, then build audit records.
+    session.flush()
+    print(f"  [{label}] Flushed inserts")
+
+    for entity_data, entity in new_entities:
+        inserted += 1
+        pending_audits.append(EntityAudit(
+            snapshot_id=snapshot.id,
+            entity_id=entity.id,
+            source_list=source_list,
+            source_id=entity_data["source_id"],
+            change_type="added",
+            changed_at=now,
+            primary_name=entity_data["primary_name"],
+            previous_data=None,
+            new_data=json.dumps(_scalar_fields(entity_data)),
+        ))
+
+    session.flush()
+    print(f"  [{label}] Flushed updates")
+
+    for entity_data, existing, prev_data in to_update:
+        updated += 1
+        pending_audits.append(EntityAudit(
+            snapshot_id=snapshot.id,
+            entity_id=existing.id,
+            source_list=source_list,
+            source_id=entity_data["source_id"],
+            change_type="updated",
+            changed_at=now,
+            primary_name=entity_data["primary_name"],
+            previous_data=json.dumps(prev_data),
+            new_data=json.dumps(_scalar_fields(entity_data)),
+        ))
+
+    if pending_audits:
+        session.add_all(pending_audits)
         session.flush()
-        for action, prev_data, new_data, entity, entity_data in batch_buffer:
-            if action == "inserted":
-                inserted += 1
-                pending_audits.append(EntityAudit(
-                    snapshot_id=snapshot.id,
-                    entity_id=entity.id,
-                    source_list=source_list,
-                    source_id=entity_data["source_id"],
-                    change_type="added",
-                    changed_at=now,
-                    primary_name=entity_data["primary_name"],
-                    previous_data=None,
-                    new_data=json.dumps(new_data),
-                ))
-            elif action == "updated" and prev_data != new_data:
-                updated += 1
-                pending_audits.append(EntityAudit(
-                    snapshot_id=snapshot.id,
-                    entity_id=entity.id,
-                    source_list=source_list,
-                    source_id=entity_data["source_id"],
-                    change_type="updated",
-                    changed_at=now,
-                    primary_name=entity_data["primary_name"],
-                    previous_data=json.dumps(prev_data),
-                    new_data=json.dumps(new_data),
-                ))
-        batch_buffer.clear()
+        pending_audits.clear()
 
     # --- Removal detection ---
-    # Fetch all currently-active entities for this source list in Python and
-    # diff against seen_source_ids. Using a NOT IN clause risks hitting
-    # SQLite's variable limit (~999) for large lists like OFAC.
+    # Use the already-loaded existing_map — no extra query needed.
     removed = 0
-    active_entities = (
-        session.query(Entity)
-        .filter_by(source_list=source_list, is_active=True)
-        .all()
-    )
-    for entity in active_entities:
-        if entity.source_id not in seen_source_ids:
+    for entity in existing_map.values():
+        if entity.source_id not in seen_source_ids and entity.is_active:
             prev_data = _scalar_fields(entity)
             entity.is_active = False
             pending_audits.append(EntityAudit(
@@ -397,6 +431,7 @@ def _run_ingestion(source_list, label, download_fn, parse_fn, date_extractor=Non
             archive_path=archive_path,
             status="in_progress",
         )
+        print(snapshot)
         session.add(snapshot)
         session.flush()
 
