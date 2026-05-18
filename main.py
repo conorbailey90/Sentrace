@@ -181,8 +181,6 @@ def health_check(db: Session = Depends(get_db)):
         count = db.query(Entity).filter(Entity.source_list == source_list).count()
         entry_counts[source_list] = count
 
-    raw_total = db.execute(text("SELECT COUNT(*) FROM entities")).scalar()
-    print(f"ORM total: {sum(entry_counts.values())}, Raw SQL total: {raw_total}")
 
     return HealthCheckResponse(
         status="healthy" if database_connected else "unhealthy",
